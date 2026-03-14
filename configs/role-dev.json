@@ -1,0 +1,51 @@
+{
+  "name": "开发岗",
+  "version": 1,
+  "rules": [
+    {
+      "id": "edu_master", "name": "硕士及以上加分", "field": "education",
+      "type": "bonus", "operator": "in", "value": ["硕士", "博士", "MBA"], "score": 20, "enabled": true
+    },
+    {
+      "id": "edu_below", "name": "大专及以下减分", "field": "education",
+      "type": "penalty", "operator": "in", "value": ["大专", "高中", "中专", "初中"], "score": -30, "enabled": true
+    },
+    {
+      "id": "school_985", "name": "985院校加分", "field": "school",
+      "type": "bonus", "operator": "schoolLevel", "value": "985", "score": 25, "enabled": true
+    },
+    {
+      "id": "school_211", "name": "211院校加分", "field": "school",
+      "type": "bonus", "operator": "schoolLevel", "value": "211", "score": 15, "enabled": true
+    },
+    {
+      "id": "school_overseas", "name": "海外名校加分", "field": "school",
+      "type": "bonus", "operator": "schoolLevel", "value": "overseas", "score": 20, "enabled": true
+    },
+    {
+      "id": "exp_ideal", "name": "3-7年经验优先", "field": "experience",
+      "type": "bonus", "operator": "between", "value": [3, 7], "score": 15, "enabled": true
+    },
+    {
+      "id": "company_top", "name": "大厂经历加分", "field": "company",
+      "type": "bonus", "operator": "listMatch", "value": "topCompanies", "score": 15, "enabled": true
+    },
+    {
+      "id": "keyword_positive", "name": "包含加分关键词", "field": "rawText",
+      "type": "bonus", "operator": "containsAny", "value": [], "score": 10, "enabled": true
+    },
+    {
+      "id": "keyword_negative", "name": "包含减分关键词", "field": "rawText",
+      "type": "penalty", "operator": "containsAny", "value": [], "score": -15, "enabled": true
+    },
+    {
+      "id": "salary_over", "name": "期望薪资超预算", "field": "salaryMax",
+      "type": "knockout", "operator": "gt", "value": 0, "score": -100, "enabled": false
+    }
+  ],
+  "positiveKeywords": ["React", "Vue", "TypeScript", "Node", "Go", "Java", "Python", "Rust", "Kubernetes", "Docker", "微服务", "分布式"],
+  "negativeKeywords": ["外包", "培训", "实习"],
+  "thresholdHigh": 70,
+  "thresholdLow": 40,
+  "salaryMax": 0
+}

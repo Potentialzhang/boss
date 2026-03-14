@@ -11,6 +11,8 @@
 // @grant        GM_addStyle
 // @grant        GM_registerMenuCommand
 // @grant        GM_notification
+// @grant        GM_xmlhttpRequest
+// @connect      raw.githubusercontent.com
 // @run-at       document-start
 // ==/UserScript==
 
@@ -24,6 +26,14 @@
   const SCRIPT_PREFIX = 'bh';
   const CONFIG_KEY = 'boss_helper_config_v1';
   const PROBE_KEY = 'boss_helper_probe_mode';
+  const REMOTE_CACHE_KEY = 'boss_helper_remote_config_v1';
+  const ROLE_URL_KEY = 'boss_helper_role_url';
+  const GITHUB_BASE = 'https://raw.githubusercontent.com/freekingxx/boss/main/configs';
+  const ROLE_CONFIGS = {
+    dev:     { name: '开发岗', url: `${GITHUB_BASE}/role-dev.json` },
+    ops:     { name: '运营岗', url: `${GITHUB_BASE}/role-ops.json` },
+    product: { name: '产品岗', url: `${GITHUB_BASE}/role-pm.json` }
+  };
 
   // 985院校名单
   const SCHOOLS_985 = [
@@ -161,7 +171,10 @@
       apiEndpoints: [],
       debugMode: false,
       notifyEnabled: true,
-      notifySound: true
+      notifySound: true,
+      roleKey: '',
+      configUrl: '',
+      lastRemoteSync: 0
     };
   }
 
@@ -258,6 +271,76 @@
     config.thresholdHigh = preset.thresholdHigh;
     config.thresholdLow = preset.thresholdLow;
     config.salaryMax = preset.salaryMax;
+    syncKeywordsToRules();
+    saveConfig();
+    rescoreAllCards();
+  }
+
+  // --- 远程配置 ---
+
+  function fetchRemoteConfig(url, onDone) {
+    if (!url) {
+      url = config.configUrl;
+    }
+    if (!url) {
+      if (onDone) onDone(false, '未设置配置源URL');
+      return;
+    }
+    console.log('[BOSS助手] 正在拉取远程配置:', url);
+    GM_xmlhttpRequest({
+      method: 'GET',
+      url: url + '?t=' + Date.now(),
+      timeout: 10000,
+      onload: function (resp) {
+        if (resp.status === 200) {
+          try {
+            const remoteData = JSON.parse(resp.responseText);
+            GM_setValue(REMOTE_CACHE_KEY, resp.responseText);
+            applyRemoteConfig(remoteData);
+            config.lastRemoteSync = Date.now();
+            saveConfig();
+            console.log('[BOSS助手] 远程配置加载成功:', remoteData.name || '未命名');
+            if (onDone) onDone(true, remoteData.name || '加载成功');
+          } catch (e) {
+            console.warn('[BOSS助手] 远程配置解析失败', e);
+            if (onDone) onDone(false, '配置JSON解析失败');
+          }
+        } else {
+          console.warn('[BOSS助手] 远程配置拉取失败, HTTP', resp.status);
+          if (onDone) onDone(false, 'HTTP ' + resp.status);
+        }
+      },
+      onerror: function (err) {
+        console.warn('[BOSS助手] 远程配置请求失败', err);
+        if (onDone) onDone(false, '网络错误');
+      },
+      ontimeout: function () {
+        console.warn('[BOSS助手] 远程配置请求超时');
+        if (onDone) onDone(false, '请求超时');
+      }
+    });
+  }
+
+  function applyRemoteConfig(remoteData) {
+    // 只覆盖评分相关字段，保留本地运行时设置
+    if (remoteData.rules && Array.isArray(remoteData.rules)) {
+      config.rules = JSON.parse(JSON.stringify(remoteData.rules));
+    }
+    if (remoteData.positiveKeywords) {
+      config.positiveKeywords = [...remoteData.positiveKeywords];
+    }
+    if (remoteData.negativeKeywords) {
+      config.negativeKeywords = [...remoteData.negativeKeywords];
+    }
+    if (typeof remoteData.thresholdHigh === 'number') {
+      config.thresholdHigh = remoteData.thresholdHigh;
+    }
+    if (typeof remoteData.thresholdLow === 'number') {
+      config.thresholdLow = remoteData.thresholdLow;
+    }
+    if (typeof remoteData.salaryMax === 'number') {
+      config.salaryMax = remoteData.salaryMax;
+    }
     syncKeywordsToRules();
     saveConfig();
     rescoreAllCards();
@@ -1535,6 +1618,8 @@
     const body = panel.querySelector(`#${SCRIPT_PREFIX}-panel-body`);
     body.innerHTML = '';
 
+    // 配置源（远程角色配置）
+    body.appendChild(createConfigSourceSection());
     // 预设模板
     body.appendChild(createPresetSection());
     // 评分阈值
@@ -1549,6 +1634,131 @@
     body.appendChild(createSchoolSection());
     // 高级设置
     body.appendChild(createAdvancedSection());
+  }
+
+  // --- 配置源 ---
+  function createConfigSourceSection() {
+    const section = createSection('配置源');
+    const content = section.querySelector(`.${SCRIPT_PREFIX}-section-content`);
+
+    // 角色选择
+    const roleRow = document.createElement('div');
+    roleRow.style.cssText = 'display: flex; align-items: center; gap: 8px; margin-bottom: 10px;';
+
+    const roleLabel = document.createElement('label');
+    roleLabel.textContent = '角色:';
+    roleLabel.style.cssText = 'flex-shrink: 0; font-weight: 500;';
+
+    const roleSelect = document.createElement('select');
+    roleSelect.style.cssText = 'flex: 1; padding: 6px 8px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 13px;';
+
+    const noneOpt = document.createElement('option');
+    noneOpt.value = '';
+    noneOpt.textContent = '-- 不使用远程配置 --';
+    roleSelect.appendChild(noneOpt);
+
+    for (const [key, role] of Object.entries(ROLE_CONFIGS)) {
+      const opt = document.createElement('option');
+      opt.value = key;
+      opt.textContent = role.name;
+      if (config.roleKey === key) opt.selected = true;
+      roleSelect.appendChild(opt);
+    }
+
+    const customOpt = document.createElement('option');
+    customOpt.value = '_custom';
+    customOpt.textContent = '自定义URL';
+    if (config.roleKey === '_custom') customOpt.selected = true;
+    roleSelect.appendChild(customOpt);
+
+    roleRow.appendChild(roleLabel);
+    roleRow.appendChild(roleSelect);
+    content.appendChild(roleRow);
+
+    // 自定义URL输入框（仅在选择自定义时显示）
+    const urlRow = document.createElement('div');
+    urlRow.style.cssText = 'display: flex; align-items: center; gap: 8px; margin-bottom: 10px;' +
+      (config.roleKey === '_custom' ? '' : ' display: none;');
+
+    const urlInput = document.createElement('input');
+    urlInput.type = 'text';
+    urlInput.placeholder = '输入远程配置JSON的URL';
+    urlInput.value = config.roleKey === '_custom' ? (config.configUrl || '') : '';
+    urlInput.style.cssText = 'flex: 1; padding: 6px 8px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 13px;';
+
+    urlRow.appendChild(urlInput);
+    content.appendChild(urlRow);
+
+    // 同步按钮行
+    const actionRow = document.createElement('div');
+    actionRow.style.cssText = 'display: flex; align-items: center; gap: 8px; margin-bottom: 6px;';
+
+    const syncBtn = document.createElement('button');
+    syncBtn.className = `${SCRIPT_PREFIX}-btn ${SCRIPT_PREFIX}-btn-outline`;
+    syncBtn.textContent = '立即同步';
+    syncBtn.style.cssText = 'flex-shrink: 0;';
+
+    const statusSpan = document.createElement('span');
+    statusSpan.style.cssText = 'font-size: 12px; color: #999;';
+    if (config.lastRemoteSync) {
+      const d = new Date(config.lastRemoteSync);
+      statusSpan.textContent = '上次同步: ' + d.toLocaleString('zh-CN');
+    } else if (config.configUrl) {
+      statusSpan.textContent = '尚未同步';
+    }
+
+    actionRow.appendChild(syncBtn);
+    actionRow.appendChild(statusSpan);
+    content.appendChild(actionRow);
+
+    // 角色切换事件
+    roleSelect.addEventListener('change', () => {
+      const val = roleSelect.value;
+      config.roleKey = val;
+      if (val && val !== '_custom') {
+        config.configUrl = ROLE_CONFIGS[val].url;
+        urlRow.style.display = 'none';
+      } else if (val === '_custom') {
+        config.configUrl = urlInput.value;
+        urlRow.style.display = 'flex';
+      } else {
+        config.configUrl = '';
+        urlRow.style.display = 'none';
+      }
+      saveConfig();
+    });
+
+    // URL输入事件
+    urlInput.addEventListener('change', () => {
+      config.configUrl = urlInput.value.trim();
+      saveConfig();
+    });
+
+    // 同步按钮事件
+    syncBtn.addEventListener('click', () => {
+      if (!config.configUrl) {
+        statusSpan.textContent = '请先选择角色或输入URL';
+        statusSpan.style.color = '#f44336';
+        return;
+      }
+      syncBtn.disabled = true;
+      syncBtn.textContent = '同步中...';
+      statusSpan.textContent = '';
+      fetchRemoteConfig(config.configUrl, (ok, msg) => {
+        syncBtn.disabled = false;
+        syncBtn.textContent = '立即同步';
+        if (ok) {
+          statusSpan.textContent = '同步成功: ' + msg;
+          statusSpan.style.color = '#4CAF50';
+          refreshPanelContent();
+        } else {
+          statusSpan.textContent = '同步失败: ' + msg;
+          statusSpan.style.color = '#f44336';
+        }
+      });
+    });
+
+    return section;
   }
 
   // --- 预设模板 ---
@@ -2120,6 +2330,15 @@
     console.log('%c[BOSS助手] 已启动 v0.1.0', 'color: #1677ff; font-weight: bold; font-size: 14px');
     if (config.probeMode) {
       console.log('%c[BOSS助手] 探测模式已开启，请浏览页面并在控制台查看拦截到的API请求', 'color: orange; font-size: 13px');
+    }
+
+    // 异步加载远程配置（不阻塞初始化）
+    if (config.configUrl) {
+      fetchRemoteConfig(config.configUrl, (ok, msg) => {
+        if (ok) {
+          console.log('[BOSS助手] 远程配置自动同步完成:', msg);
+        }
+      });
     }
   }
 
