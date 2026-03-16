@@ -669,7 +669,8 @@
       case '985':
         return SCHOOLS_985.some(s => school.includes(s));
       case '211':
-        return [...SCHOOLS_985, ...SCHOOLS_211_ONLY].some(s => school.includes(s));
+        // 仅匹配纯211院校，985已由985规则处理，避免重复加分
+        return SCHOOLS_211_ONLY.some(s => school.includes(s));
       case 'overseas':
         return OVERSEAS_KEYWORDS.some(k => school.includes(k));
       default:
