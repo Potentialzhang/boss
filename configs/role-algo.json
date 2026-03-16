@@ -73,6 +73,12 @@
       "score": -15, "enabled": true
     },
     {
+      "id": "tech_non_cpp", "name": "非C++技术栈减分", "field": "rawText",
+      "type": "penalty", "operator": "containsAnyWord",
+      "value": ["Java", "Python", "Golang", "Go", "嵌入式", "PHP", "Ruby", ".NET", "Kotlin", "Swift"],
+      "score": -10, "enabled": true
+    },
+    {
       "id": "keyword_positive", "name": "包含加分关键词", "field": "rawText",
       "type": "bonus", "operator": "containsAny", "value": [], "score": 10, "enabled": true
     },

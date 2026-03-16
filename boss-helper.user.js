@@ -613,6 +613,31 @@
         continue;
       }
 
+      // containsAnyWord: 类似containsAny，但对英文关键词使用单词边界匹配
+      // 避免 "Java" 匹配到 "JavaScript" 等子串误命中问题
+      if (rule.operator === 'containsAnyWord' && Array.isArray(rule.value) && rule.value.length > 0) {
+        const text = typeof fieldValue === 'string' ? fieldValue : '';
+        if (text) {
+          const matchedKeywords = rule.value.filter(keyword => {
+            if (/^[a-zA-Z0-9+#_./-]+$/.test(keyword)) {
+              // 英文关键词：用前后非字母断言做单词边界匹配
+              try {
+                const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                return new RegExp('(?<![a-zA-Z])' + escaped + '(?![a-zA-Z])', 'i').test(text);
+              } catch (e) { return text.includes(keyword); }
+            }
+            // 中文关键词：直接 includes
+            return text.includes(keyword);
+          });
+          if (matchedKeywords.length > 0) {
+            const delta = rule.score * matchedKeywords.length;
+            score += delta;
+            matchedRules.push({ ...rule, applied: true, matchedKeywords, effectiveScore: delta });
+          }
+        }
+        continue;
+      }
+
       const matched = evaluateCondition(rule, fieldValue, candidate);
 
       if (matched) {
@@ -1962,7 +1987,8 @@
       { value: 'containsAny', label: '包含任一' },
       { value: 'regex', label: '正则匹配' },
       { value: 'schoolLevel', label: '院校等级' },
-      { value: 'gtPerUnit', label: '每超1单位' }
+      { value: 'gtPerUnit', label: '每超1单位' },
+      { value: 'containsAnyWord', label: '包含任一词(精确)' }
     ];
 
     const form = document.createElement('div');
