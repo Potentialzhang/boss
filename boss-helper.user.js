@@ -306,7 +306,7 @@
 
   // --- 远程配置 ---
 
-  function fetchRemoteConfig(url, onDone) {
+  function fetchRemoteConfig(url, onDone, force) {
     if (!url) {
       url = config.configUrl;
     }
@@ -324,7 +324,7 @@
           try {
             const remoteData = JSON.parse(resp.responseText);
             GM_setValue(REMOTE_CACHE_KEY, resp.responseText);
-            applyRemoteConfig(remoteData);
+            applyRemoteConfig(remoteData, force);
             config.lastRemoteSync = Date.now();
             saveConfig();
             console.log('[BOSS助手] 远程配置加载成功:', remoteData.name || '未命名');
@@ -349,31 +349,32 @@
     });
   }
 
-  function applyRemoteConfig(remoteData) {
-    // 只覆盖评分相关字段，保留本地运行时设置
-    if (remoteData.rules && Array.isArray(remoteData.rules)) {
-      config.rules = JSON.parse(JSON.stringify(remoteData.rules));
-    }
-    // 关键词仅在切换角色时覆盖，同角色再次同步保留本地编辑
+  function applyRemoteConfig(remoteData, force) {
     const isNewRole = !config.lastSyncedRole || config.lastSyncedRole !== (remoteData.name || '');
-    if (isNewRole) {
+    const shouldOverwrite = force || isNewRole;
+
+    // rules、阈值、薪资仅在换角色或手动同步时覆盖，F5自动同步保留本地编辑
+    if (shouldOverwrite) {
+      if (remoteData.rules && Array.isArray(remoteData.rules)) {
+        config.rules = JSON.parse(JSON.stringify(remoteData.rules));
+      }
       if (remoteData.positiveKeywords) {
         config.positiveKeywords = [...remoteData.positiveKeywords];
       }
       if (remoteData.negativeKeywords) {
         config.negativeKeywords = [...remoteData.negativeKeywords];
       }
+      if (typeof remoteData.thresholdHigh === 'number') {
+        config.thresholdHigh = remoteData.thresholdHigh;
+      }
+      if (typeof remoteData.thresholdLow === 'number') {
+        config.thresholdLow = remoteData.thresholdLow;
+      }
+      if (typeof remoteData.salaryMax === 'number') {
+        config.salaryMax = remoteData.salaryMax;
+      }
     }
     config.lastSyncedRole = remoteData.name || '';
-    if (typeof remoteData.thresholdHigh === 'number') {
-      config.thresholdHigh = remoteData.thresholdHigh;
-    }
-    if (typeof remoteData.thresholdLow === 'number') {
-      config.thresholdLow = remoteData.thresholdLow;
-    }
-    if (typeof remoteData.salaryMax === 'number') {
-      config.salaryMax = remoteData.salaryMax;
-    }
     syncKeywordsToRules();
     normalizeNotifyThreshold();
     saveConfig();
@@ -1878,7 +1879,7 @@
           statusSpan.textContent = '同步失败: ' + msg;
           statusSpan.style.color = '#f44336';
         }
-      });
+      }, true); // force=true: 手动同步强制覆盖本地
     });
 
     // 期望性别
