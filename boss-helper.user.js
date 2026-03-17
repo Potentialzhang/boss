@@ -27,6 +27,7 @@
   const CONFIG_KEY = 'boss_helper_config_v1';
   const PROBE_KEY = 'boss_helper_probe_mode';
   const REMOTE_CACHE_KEY = 'boss_helper_remote_config_v1';
+  const REJECTED_KEY = 'boss_helper_rejected_v1';
   const ROLE_URL_KEY = 'boss_helper_role_url';
   const GITHUB_BASE = 'https://raw.githubusercontent.com/freekingxx/boss/main/configs';
   const ROLE_CONFIGS = {
@@ -201,6 +202,21 @@
 
   let config = null;
   const configListeners = [];
+
+  // 「不合适」标记 — name → timestamp
+  let rejectedMap = {};
+
+  function loadRejected() {
+    try { rejectedMap = JSON.parse(GM_getValue(REJECTED_KEY, '{}')); }
+    catch (e) { rejectedMap = {}; }
+  }
+  function saveRejected() { GM_setValue(REJECTED_KEY, JSON.stringify(rejectedMap)); }
+  function isRejected(name) { return !!rejectedMap[name]; }
+  function toggleRejected(name) {
+    if (rejectedMap[name]) delete rejectedMap[name];
+    else rejectedMap[name] = Date.now();
+    saveRejected();
+  }
 
   function loadConfig() {
     try {
@@ -802,6 +818,7 @@
 
   function notifyHighScoreCandidate(candidate, result, cardElement) {
     if (!config.notifyEnabled) return;
+    if (isRejected(candidate.name)) return; // 已标记不合适，跳过通知
     if (result.score < config.notifyThreshold) return;
     const key = candidate.name + '_' + result.score;
     if (notifiedCandidates.has(key)) return;
@@ -1097,6 +1114,17 @@
         opacity: 0.85 !important;
       }
 
+      /* 不合适标记按钮 */
+      .${SCRIPT_PREFIX}-reject-btn {
+        position: absolute; top: 8px; right: 70px; z-index: 10;
+        padding: 2px 8px; border-radius: 4px; font-size: 11px;
+        cursor: pointer; border: 1px solid #ddd; background: #fff;
+        color: #999; transition: all 0.2s; line-height: 18px;
+      }
+      .${SCRIPT_PREFIX}-reject-btn:hover { color: #f44336; border-color: #f44336; }
+      .${SCRIPT_PREFIX}-reject-btn.active { background: #f44336; color: #fff; border-color: #f44336; }
+      .${SCRIPT_PREFIX}-card-rejected { opacity: 0.45 !important; }
+
       /* 悬停提示 */
       .${SCRIPT_PREFIX}-tooltip {
         display: none;
@@ -1114,7 +1142,7 @@
         white-space: pre-line;
         box-shadow: 0 2px 8px rgba(0,0,0,0.3);
       }
-      .${SCRIPT_PREFIX}-badge:hover + .${SCRIPT_PREFIX}-tooltip,
+      .${SCRIPT_PREFIX}-badge:hover ~ .${SCRIPT_PREFIX}-tooltip,
       .${SCRIPT_PREFIX}-tooltip:hover {
         display: block;
       }
@@ -1633,6 +1661,23 @@
     badge.textContent = `${result.score}分`;
     card.appendChild(badge);
 
+    // 「不合适」标记按钮
+    const candidateName = candidate.name;
+    const rejectBtn = document.createElement('span');
+    rejectBtn.className = `${SCRIPT_PREFIX}-reject-btn` + (isRejected(candidateName) ? ' active' : '');
+    rejectBtn.textContent = '✕ 不合适';
+    rejectBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      toggleRejected(candidateName);
+      rejectBtn.classList.toggle('active');
+      card.classList.toggle(`${SCRIPT_PREFIX}-card-rejected`);
+    });
+    card.appendChild(rejectBtn);
+    if (isRejected(candidateName)) {
+      card.classList.add(`${SCRIPT_PREFIX}-card-rejected`);
+    }
+
     // 高亮关键词标签（显示在分数旁边）
     if (result.highlightedKeywords && result.highlightedKeywords.length > 0) {
       const keywordBadge = document.createElement('span');
@@ -1677,8 +1722,8 @@
     const cards = getCardElements();
     cards.forEach(card => {
       card.dataset.bhScored = '';
-      card.querySelectorAll(`.${SCRIPT_PREFIX}-badge, .${SCRIPT_PREFIX}-tooltip`).forEach(el => el.remove());
-      card.classList.remove(`${SCRIPT_PREFIX}-card-high`, `${SCRIPT_PREFIX}-card-medium`, `${SCRIPT_PREFIX}-card-low`);
+      card.querySelectorAll(`.${SCRIPT_PREFIX}-badge, .${SCRIPT_PREFIX}-tooltip, .${SCRIPT_PREFIX}-reject-btn`).forEach(el => el.remove());
+      card.classList.remove(`${SCRIPT_PREFIX}-card-high`, `${SCRIPT_PREFIX}-card-medium`, `${SCRIPT_PREFIX}-card-low`, `${SCRIPT_PREFIX}-card-rejected`);
       card.style.opacity = '';
     });
     processCards();
@@ -2651,6 +2696,7 @@
   function init() {
     // 加载配置
     loadConfig();
+    loadRejected();
 
     // 注入拦截器（在document-start阶段）
     setupInterceptors();
