@@ -106,8 +106,8 @@
       type: 'bonus', operator: 'schoolLevel', value: '211', score: 10, enabled: true
     },
     {
-      id: 'school_overseas', name: '海外名校加分', field: 'school',
-      type: 'bonus', operator: 'schoolLevel', value: 'overseas', score: 15, enabled: true
+      id: 'school_overseas', name: '海外名校硕士加分', field: 'school',
+      type: 'bonus', operator: 'overseasMaster', value: null, score: 15, enabled: true
     },
     {
       id: 'exp_ideal', name: '3-7年经验优先', field: 'experience',
@@ -128,6 +128,14 @@
     {
       id: 'salary_over', name: '期望薪资超预算', field: 'salaryMax',
       type: 'knockout', operator: 'gt', value: 0, score: -100, enabled: false
+    },
+    {
+      id: 'job_hopping', name: '频繁跳槽扣分', field: '_computed',
+      type: 'penalty', operator: 'jobHopping', value: null, score: -10, enabled: true
+    },
+    {
+      id: 'work_gap', name: '工作空窗期扣分', field: '_computed',
+      type: 'penalty', operator: 'workGap', value: null, score: -8, enabled: true
     }
   ];
 
@@ -595,6 +603,9 @@
       salaryMax = parseInt(salaryMatch[2]);
     }
 
+    // 计算跳槽/空窗指标
+    const jobMetrics = computeJobMetrics(raw, experience);
+
     return {
       name,
       age: typeof age === 'number' ? age : null,
@@ -608,6 +619,9 @@
       skills: Array.isArray(skills) ? skills.map(s => typeof s === 'string' ? s : s.name || '') : [],
       status: status || null,
       gender: gender,
+      jobCount: jobMetrics.jobCount,
+      gapCount: jobMetrics.gapCount,
+      maxGapMonths: jobMetrics.maxGapMonths,
       rawText: text,
       source: 'api'
     };
@@ -621,6 +635,68 @@
   function extractMatch(text, regex) {
     const m = text.match(regex);
     return m ? m[1] : null;
+  }
+
+  // 从API原始数据中查找工作经历数组
+  function findWorkExpList(raw) {
+    if (!raw || typeof raw !== 'object') return [];
+    const fields = ['geekWorkExpList', 'workExpList', 'workList', 'expList',
+      'workExperience', 'experiences', 'jobList'];
+    for (const key of fields) {
+      if (Array.isArray(raw[key]) && raw[key].length > 0) return raw[key];
+    }
+    // 搜索一层嵌套
+    for (const key of Object.keys(raw)) {
+      const val = raw[key];
+      if (val && typeof val === 'object' && !Array.isArray(val)) {
+        for (const subKey of fields) {
+          if (Array.isArray(val[subKey]) && val[subKey].length > 0) return val[subKey];
+        }
+      }
+    }
+    return [];
+  }
+
+  function parseWorkDate(val) {
+    if (!val) return null;
+    if (typeof val === 'number') return new Date(val > 1e12 ? val : val * 1000);
+    const m = String(val).match(/(\d{4})[-./年](\d{1,2})/);
+    return m ? new Date(parseInt(m[1]), parseInt(m[2]) - 1) : null;
+  }
+
+  // 计算跳槽频率和空窗期指标
+  function computeJobMetrics(raw, totalExp) {
+    const workList = findWorkExpList(raw);
+    const jobCount = workList.length;
+    if (jobCount === 0) {
+      // 兜底：从文本中提取"N段工作经历"
+      const text = typeof raw === 'string' ? raw : JSON.stringify(raw);
+      const m = text.match(/(\d+)\s*段/);
+      return { jobCount: m ? parseInt(m[1]) : 0, gapCount: 0, maxGapMonths: 0 };
+    }
+
+    // 提取日期并计算空窗期
+    const periods = [];
+    for (const exp of workList) {
+      const start = parseWorkDate(exp.startDate || exp.startTime || exp.start || exp.beginTime || exp.startdate);
+      const end = parseWorkDate(exp.endDate || exp.endTime || exp.end || exp.finishTime || exp.enddate);
+      if (start) periods.push({ start, end });
+    }
+    periods.sort((a, b) => a.start - b.start);
+
+    let gapCount = 0, maxGapMonths = 0;
+    for (let i = 1; i < periods.length; i++) {
+      const prevEnd = periods[i - 1].end;
+      const currStart = periods[i].start;
+      if (prevEnd && currStart && currStart > prevEnd) {
+        const months = (currStart - prevEnd) / (1000 * 60 * 60 * 24 * 30);
+        if (months > 1) { // 忽略 < 1个月的正常交接期
+          gapCount++;
+          maxGapMonths = Math.max(maxGapMonths, months);
+        }
+      }
+    }
+    return { jobCount, gapCount, maxGapMonths: Math.round(maxGapMonths) };
   }
 
   // ============================================================
@@ -703,6 +779,42 @@
         if (config.expectedGender && typeof fieldValue === 'string' && fieldValue && fieldValue !== config.expectedGender) {
           score += rule.score;
           matchedRules.push({ ...rule, applied: true, effectiveScore: rule.score });
+        }
+        continue;
+      }
+
+      // overseasMaster: 海外名校仅对硕士及以上加分，本科不加
+      if (rule.operator === 'overseasMaster') {
+        const masterDegrees = ['硕士', '博士', 'MBA'];
+        if (candidate.education && masterDegrees.includes(candidate.education) &&
+            candidate.school && OVERSEAS_KEYWORDS.some(k => candidate.school.includes(k))) {
+          score += rule.score;
+          matchedRules.push({ ...rule, applied: true, effectiveScore: rule.score });
+        }
+        continue;
+      }
+
+      // jobHopping: 频繁跳槽检测 — 平均每份工作不足2年则扣分
+      if (rule.operator === 'jobHopping') {
+        if (candidate.jobCount >= 2 && candidate.experience > 0) {
+          const avgTenure = candidate.experience / candidate.jobCount;
+          if (avgTenure < 2) {
+            const severity = avgTenure < 1 ? 2 : 1; // 不足1年双倍扣分
+            const delta = rule.score * severity;
+            score += delta;
+            matchedRules.push({ ...rule, applied: true, effectiveScore: delta });
+          }
+        }
+        continue;
+      }
+
+      // workGap: 工作空窗期检测 — 2段以上或单段超3个月
+      if (rule.operator === 'workGap') {
+        if (candidate.gapCount >= 2 || candidate.maxGapMonths > 3) {
+          const severity = (candidate.gapCount >= 2 && candidate.maxGapMonths > 3) ? 2 : 1;
+          const delta = rule.score * severity;
+          score += delta;
+          matchedRules.push({ ...rule, applied: true, effectiveScore: delta });
         }
         continue;
       }
@@ -1005,6 +1117,9 @@
       salaryDesc: salaryMatch ? salaryMatch[0] : '',
       skills: [],
       status: extractMatch(text, /(在职|离职|在校|应届)/),
+      jobCount: extractNumber(text, /(\d+)\s*段/) || 0,
+      gapCount: 0,
+      maxGapMonths: 0,
       rawText: text,
       source: 'dom'
     };
