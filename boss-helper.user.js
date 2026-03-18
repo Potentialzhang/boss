@@ -640,8 +640,8 @@
   // 从API原始数据中查找工作经历数组
   function findWorkExpList(raw) {
     if (!raw || typeof raw !== 'object') return [];
-    const fields = ['geekWorkExpList', 'workExpList', 'workList', 'expList',
-      'workExperience', 'experiences', 'jobList'];
+    const fields = ['geekWorks', 'showWorks', 'geekWorkExpList', 'workExpList',
+      'workList', 'expList', 'workExperience', 'experiences', 'jobList'];
     for (const key of fields) {
       if (Array.isArray(raw[key]) && raw[key].length > 0) return raw[key];
     }
