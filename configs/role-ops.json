@@ -29,13 +29,13 @@
       "score": -10, "enabled": true
     },
     {
-      "id": "major_stem_finance", "name": "理工科/金融经济专业加分", "field": "rawText",
+      "id": "major_stem_finance", "name": "理工科/金融经济专业加分", "field": "major",
       "type": "bonus", "operator": "containsAny",
       "value": ["计算机", "软件工程", "信息", "数学", "统计", "物理", "电子", "通信", "自动化", "数据科学", "人工智能", "金融", "经济", "金融学", "经济学", "财务", "会计", "工商管理", "市场营销", "国际贸易"],
       "score": 8, "enabled": true
     },
     {
-      "id": "major_exclude", "name": "明显不相关专业减分", "field": "rawText",
+      "id": "major_exclude", "name": "明显不相关专业减分", "field": "major",
       "type": "penalty", "operator": "containsAny",
       "value": ["土木工程", "建筑学", "农学", "畜牧", "林学", "临床医学", "护理学", "中医", "药学", "美术", "音乐", "体育"],
       "score": -25, "enabled": true

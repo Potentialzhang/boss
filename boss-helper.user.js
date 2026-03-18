@@ -271,16 +271,48 @@
 
   function mergeRulesWithDefaults(rules) {
     const nextRules = Array.isArray(rules) ? JSON.parse(JSON.stringify(rules)) : [];
-    // 旧的本地配置、导入文件、远程角色配置可能缺少后续新增的 gap 规则，回填以避免静默失效。
-    const requiredRuleIds = ['work_gap'];
+    nextRules.forEach((rule, index) => {
+      nextRules[index] = normalizeKnownRuleShape(rule);
+    });
+    // 旧的本地配置、导入文件、远程角色配置可能缺少或误改后续新增的计算规则，回填并校正以避免静默失效。
+    const requiredRuleIds = ['job_hopping', 'work_gap'];
     requiredRuleIds.forEach((ruleId) => {
-      if (nextRules.some(rule => rule.id === ruleId)) return;
       const defaultRule = DEFAULT_RULES.find(rule => rule.id === ruleId);
-      if (defaultRule) {
+      if (!defaultRule) return;
+
+      const existingIndex = nextRules.findIndex(rule => rule.id === ruleId);
+      if (existingIndex === -1) {
         nextRules.push(JSON.parse(JSON.stringify(defaultRule)));
+        return;
       }
+
+      nextRules[existingIndex] = normalizeComputedRule(nextRules[existingIndex], defaultRule);
     });
     return nextRules;
+  }
+
+  function normalizeKnownRuleShape(rule) {
+    if (!rule || typeof rule !== 'object') return rule;
+    const nextRule = { ...rule };
+    if (['major_non_cs', 'major_stem_finance', 'major_exclude'].includes(nextRule.id)) {
+      nextRule.field = 'major';
+      nextRule.operator = 'containsAny';
+    }
+    return nextRule;
+  }
+
+  function normalizeComputedRule(rule, defaultRule) {
+    return {
+      ...rule,
+      id: defaultRule.id,
+      name: rule.name || defaultRule.name,
+      field: defaultRule.field,
+      type: defaultRule.type,
+      operator: defaultRule.operator,
+      value: defaultRule.value,
+      score: typeof rule.score === 'number' ? rule.score : defaultRule.score,
+      enabled: typeof rule.enabled === 'boolean' ? rule.enabled : defaultRule.enabled
+    };
   }
 
   function normalizeNotifyThreshold() {
@@ -584,25 +616,30 @@
 
   // 从API数据解析候选人（需要根据实际接口调整字段映射）
   function parseCandidateFromApi(raw) {
+    const card = raw?.geekCard && typeof raw.geekCard === 'object' ? raw.geekCard : raw;
+    const edus = pickFirstArray(raw?.showEdus, card?.showEdus, card?.geekEdus, raw?.geekEdus);
+    const primaryEdu = pickPrimaryEducation(card?.geekEdu, edus);
+    const works = pickFirstArray(raw?.showWorks, card?.showWorks, card?.geekWorks, raw?.geekWorks);
+    const primaryWork = pickPrimaryWork(raw?.geekLastWork, card?.geekLastWork, works);
     const text = JSON.stringify(raw);
 
     // 尝试多种可能的字段名
-    const name = raw.name || raw.geekName || raw.nickName || raw.username || '';
-    const age = raw.age || extractNumber(text, /(\d{2})岁/);
-    const education = raw.education || raw.degree || raw.degreeName ||
+    const name = card?.geekName || raw.name || raw.geekName || raw.nickName || raw.username || '';
+    const age = card?.age || raw.age || extractNumber(card?.ageDesc || '', /(\d{2})岁/) || extractNumber(text, /(\d{2})岁/);
+    const education = primaryEdu?.degreeName || card?.geekDegree || raw.education || raw.degree || raw.degreeName ||
       extractMatch(text, /(博士|硕士|MBA|本科|大专|高中|中专)/);
-    const school = raw.school || raw.schoolName || raw.university || '';
-    const experience = raw.experience || raw.workYears ||
-      extractNumber(text, /(\d+)年/);
-    const company = raw.company || raw.companyName || raw.lastCompany || '';
-    const salary = raw.expectSalary || raw.salary || raw.salaryDesc || '';
-    const skills = raw.skills || raw.skillList || raw.tags || [];
-    const status = raw.status || raw.jobStatus || raw.activeStatus || '';
+    const school = primaryEdu?.school || card?.school || raw.school || raw.schoolName || raw.university || '';
+    const major = primaryEdu?.major || card?.major || raw.major || raw.majorName || raw.specialty || raw.professional || raw.subjectName || extractMajorFromText(text);
+    const experience = parseExperienceYears(card?.workYears || card?.geekWorkYear || raw.experience || raw.workYears, text);
+    const company = primaryWork?.company || card?.company || raw.company || raw.companyName || raw.lastCompany || extractCompanyFromText(text) || '';
+    const salary = card?.salary || raw.expectSalary || raw.salary || raw.salaryDesc || '';
+    const skills = collectCandidateSkills(raw, card, works);
+    const status = card?.applyStatusDesc || raw.applyStatusDesc || card?.status || raw.status || raw.jobStatus || raw.activeStatus || '';
 
     // 解析性别
     let gender = null;
-    if (raw.gender === 1 || raw.gender === '1' || raw.genderName === '男') gender = '男';
-    else if (raw.gender === 0 || raw.gender === 2 || raw.gender === '0' || raw.gender === '2' || raw.genderName === '女') gender = '女';
+    if (card?.geekGender === 1 || card?.gender === 1 || raw.gender === 1 || raw.gender === '1' || raw.genderName === '男') gender = '男';
+    else if (card?.geekGender === 0 || card?.geekGender === 2 || card?.gender === 0 || card?.gender === 2 || raw.gender === 0 || raw.gender === 2 || raw.gender === '0' || raw.gender === '2' || raw.genderName === '女') gender = '女';
     if (!gender) {
       const genderMatch = text.match(/(?:^|[·\s",:])?(男|女)(?:[·\s",:]|$)/);
       if (genderMatch) gender = genderMatch[1];
@@ -618,27 +655,77 @@
     }
 
     // 计算跳槽/空窗指标
-    const jobMetrics = computeJobMetrics(raw, experience);
+    const metricsSource = {
+      ...raw,
+      geekWorks: works,
+      showWorks: works
+    };
+    const jobMetrics = computeJobMetrics(metricsSource, experience);
 
     return {
       name,
       age: typeof age === 'number' ? age : null,
       education: education || null,
       school: school || null,
+      major: major || null,
       experience: typeof experience === 'number' ? experience : null,
       company: company || null,
       salaryMin,
       salaryMax,
       salaryDesc: salaryStr,
-      skills: Array.isArray(skills) ? skills.map(s => typeof s === 'string' ? s : s.name || '') : [],
+      skills,
       status: status || null,
       gender: gender,
       jobCount: jobMetrics.jobCount,
       gapCount: jobMetrics.gapCount,
       maxGapMonths: jobMetrics.maxGapMonths,
+      jobPeriods: jobMetrics.periods,
+      jobPeriodsSource: jobMetrics.periodsSource,
       rawText: text,
       source: 'api'
     };
+  }
+
+  function pickFirstArray(...arrays) {
+    for (const arr of arrays) {
+      if (Array.isArray(arr) && arr.length > 0) return arr;
+    }
+    return [];
+  }
+
+  function pickPrimaryEducation(primaryEdu, edus) {
+    if (primaryEdu && typeof primaryEdu === 'object' && (primaryEdu.school || primaryEdu.major || primaryEdu.degreeName)) {
+      return primaryEdu;
+    }
+    return Array.isArray(edus) && edus.length > 0 ? edus[0] : null;
+  }
+
+  function pickPrimaryWork(primaryWork, fallbackWork, works) {
+    if (primaryWork && typeof primaryWork === 'object' && (primaryWork.company || primaryWork.positionName)) return primaryWork;
+    if (fallbackWork && typeof fallbackWork === 'object' && (fallbackWork.company || fallbackWork.positionName)) return fallbackWork;
+    return Array.isArray(works) && works.length > 0 ? works[0] : null;
+  }
+
+  function collectCandidateSkills(raw, card, works) {
+    const skills = [];
+    const pushSkill = (value) => {
+      if (!value) return;
+      const text = typeof value === 'string' ? value : (value.name || value.content || '');
+      const normalized = text.trim();
+      if (normalized && !skills.includes(normalized)) skills.push(normalized);
+    };
+
+    [raw?.skills, raw?.skillList, raw?.tags, card?.skills, card?.skillList, card?.tags, card?.matches, card?.markWords].forEach((list) => {
+      if (Array.isArray(list)) list.forEach(pushSkill);
+    });
+
+    if (Array.isArray(works)) {
+      works.forEach((work) => {
+        if (Array.isArray(work?.workEmphasisList)) work.workEmphasisList.forEach(pushSkill);
+      });
+    }
+
+    return skills;
   }
 
   function extractNumber(text, regex) {
@@ -676,12 +763,25 @@
     if (typeof val === 'number') return new Date(val > 1e12 ? val : val * 1000);
     const str = String(val).trim();
     if (/^(至今|现在|目前|present|current)$/i.test(str)) return null;
+    const compactMatch = str.match(/^(\d{4})(\d{2})(?:\d{2})?$/);
+    if (compactMatch) {
+      return new Date(parseInt(compactMatch[1]), parseInt(compactMatch[2]) - 1);
+    }
     const monthMatch = str.match(/(\d{4})\s*[-./年]\s*(\d{1,2})(?:\s*月)?/);
     if (monthMatch) {
       return new Date(parseInt(monthMatch[1]), parseInt(monthMatch[2]) - 1);
     }
     const yearMatch = str.match(/^(\d{4})$/);
     return yearMatch ? new Date(parseInt(yearMatch[1]), 0) : null;
+  }
+
+  function parseExperienceYears(val, fallbackText) {
+    if (typeof val === 'number') return val;
+    if (typeof val === 'string') {
+      const direct = extractNumber(val, /(\d+)\s*年/);
+      if (typeof direct === 'number') return direct;
+    }
+    return extractNumber(fallbackText || '', /(\d+)\s*年/);
   }
 
   function extractWorkPeriodsFromText(text) {
@@ -699,10 +799,21 @@
     return periods;
   }
 
+  function formatPeriod(period) {
+    const formatDate = (date) => {
+      if (!date) return '至今';
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      return `${year}.${month}`;
+    };
+    return `${formatDate(period.start)}-${formatDate(period.end)}`;
+  }
+
   // 计算跳槽频率和空窗期指标
   function computeJobMetrics(raw, totalExp) {
     const workList = findWorkExpList(raw);
     let jobCount = workList.length;
+    let periodsSource = workList.length > 0 ? 'api' : 'none';
 
     // 从结构化数据提取工作时间段
     let periods = [];
@@ -717,13 +828,22 @@
     if (periods.length === 0) {
       const text = typeof raw === 'string' ? raw : JSON.stringify(raw);
       periods = extractWorkPeriodsFromText(text);
-      if (periods.length > 0) jobCount = periods.length;
+      if (periods.length > 0) {
+        jobCount = periods.length;
+        periodsSource = 'text';
+      }
     }
 
     if (periods.length === 0 && jobCount === 0) {
       const text = typeof raw === 'string' ? raw : JSON.stringify(raw);
       const m = text.match(/(\d+)\s*段/);
-      return { jobCount: m ? parseInt(m[1]) : 0, gapCount: 0, maxGapMonths: 0 };
+      return {
+        jobCount: m ? parseInt(m[1]) : 0,
+        gapCount: 0,
+        maxGapMonths: 0,
+        periods: [],
+        periodsSource: 'none'
+      };
     }
 
     periods.sort((a, b) => a.start - b.start);
@@ -754,7 +874,16 @@
       }
     }
 
-    return { jobCount: Math.max(jobCount, periods.length), gapCount, maxGapMonths: Math.round(maxGapMonths) };
+    return {
+      jobCount: Math.max(jobCount, periods.length),
+      gapCount,
+      maxGapMonths: Math.round(maxGapMonths),
+      periods: periods.map(period => ({
+        start: period.start ? period.start.toISOString() : null,
+        end: period.end ? period.end.toISOString() : null
+      })),
+      periodsSource
+    };
   }
 
   // ============================================================
@@ -1145,15 +1274,69 @@
   // Section 5: DOM 解析器（兜底方案）
   // ============================================================
 
+  function sliceTextAroundCandidate(text, candidateName) {
+    if (!text || !candidateName) return text || '';
+    const idx = text.indexOf(candidateName);
+    if (idx === -1) return text;
+    const start = Math.max(0, idx - 240);
+    const end = Math.min(text.length, idx + 1400);
+    return text.slice(start, end);
+  }
+
+  function scoreCandidateTextScope(text, candidateName, distance) {
+    if (!text) return -Infinity;
+    const periodCount = extractWorkPeriodsFromText(text).length;
+    const hasName = candidateName && text.includes(candidateName) ? 1 : 0;
+    const schoolCount = (text.match(/(?:大学|学院)/g) || []).length;
+    const salaryCount = (text.match(/\d+\s*[-~·]\s*\d+\s*[Kk]/g) || []).length;
+    const lengthPenalty = Math.floor(text.length / 400);
+    return periodCount * 20 + schoolCount * 3 + hasName * 5 - salaryCount * 4 - distance * 2 - lengthPenalty;
+  }
+
+  function expandCandidateTextScope(cardElement, baseText, candidateName) {
+    let bestText = baseText || '';
+    let bestScore = scoreCandidateTextScope(bestText, candidateName, 0);
+    let node = cardElement;
+
+    for (let i = 0; i < 4 && node?.parentElement; i++) {
+      node = node.parentElement;
+      const text = node.textContent || '';
+      if (!text) continue;
+      const scopedText = candidateName ? sliceTextAroundCandidate(text, candidateName) : text;
+      const score = scoreCandidateTextScope(scopedText, candidateName, i + 1);
+      if (score > bestScore) {
+        bestText = scopedText;
+        bestScore = score;
+      }
+    }
+
+    return bestText;
+  }
+
+  function extractMajorFromText(text) {
+    if (!text) return '';
+    const majors = [];
+    const majorRegex = /[\u4e00-\u9fa5A-Za-z()（）]{2,30}(?:大学|学院)(?:（[^）]+）|\([^)]*\))?\s*[·•\-\s]\s*([^·•\-\n]{2,24}?)(?=\s*[·•\-\s]\s*(?:博士|硕士|本科|大专|专科)|\s*(?:博士|硕士|本科|大专|专科)|$)/g;
+    let match;
+    while ((match = majorRegex.exec(text)) !== null) {
+      const major = match[1].trim();
+      if (!major) continue;
+      if (/^(大学|学院|硕士|博士|本科|大专|专科)$/.test(major)) continue;
+      if (!majors.includes(major)) majors.push(major);
+    }
+    return majors.join(' | ');
+  }
+
   function parseCandidateFromDOM(cardElement) {
-    const text = cardElement.textContent || '';
-    const innerHtml = cardElement.innerHTML || '';
+    const baseText = cardElement.textContent || '';
+    const name = extractCandidateName(cardElement);
+    const text = expandCandidateTextScope(cardElement, baseText, name);
 
     const education = extractMatch(text, /(博士|硕士|MBA|本科|大专|高中|中专)/);
     const experience = extractNumber(text, /(\d+)[年]/) || extractNumber(text, /经验\s*(\d+)/);
     const age = extractNumber(text, /(\d{2})岁/);
-    const name = extractCandidateName(cardElement);
     const school = extractSchoolFromText(text);
+    const major = extractMajorFromText(text);
     const company = extractCompanyFromText(text);
 
     let salaryMin = 0, salaryMax = 0;
@@ -1168,6 +1351,7 @@
       age: age || null,
       education: education || null,
       school: school || null,
+      major: major || null,
       experience: experience || null,
       company: company || null,
       salaryMin,
@@ -1175,7 +1359,16 @@
       salaryDesc: salaryMatch ? salaryMatch[0] : '',
       skills: [],
       status: extractMatch(text, /(在职|离职|在校|应届)/),
-      ...computeJobMetrics(text, experience),
+      ...(() => {
+        const metrics = computeJobMetrics(text, experience);
+        return {
+          jobCount: metrics.jobCount,
+          gapCount: metrics.gapCount,
+          maxGapMonths: metrics.maxGapMonths,
+          jobPeriods: metrics.periods,
+          jobPeriodsSource: metrics.periodsSource
+        };
+      })(),
       rawText: text,
       source: 'dom'
     };
@@ -1783,6 +1976,28 @@
     return detectCardElements();
   }
 
+  function mergeCandidateJobMetrics(candidate, domCandidate) {
+    const merged = { ...candidate };
+    const candidatePeriods = Array.isArray(candidate.jobPeriods) ? candidate.jobPeriods : [];
+    const domPeriods = Array.isArray(domCandidate.jobPeriods) ? domCandidate.jobPeriods : [];
+
+    const shouldUseDomMetrics =
+      (candidate.jobCount || 0) === 0 ||
+      domPeriods.length > candidatePeriods.length ||
+      (domCandidate.maxGapMonths || 0) > (candidate.maxGapMonths || 0) ||
+      (domCandidate.gapCount || 0) > (candidate.gapCount || 0);
+
+    if (shouldUseDomMetrics && domPeriods.length > 0) {
+      merged.jobCount = domCandidate.jobCount;
+      merged.gapCount = domCandidate.gapCount;
+      merged.maxGapMonths = domCandidate.maxGapMonths;
+      merged.jobPeriods = domCandidate.jobPeriods;
+      merged.jobPeriodsSource = domCandidate.jobPeriodsSource || 'dom-text';
+    }
+
+    return merged;
+  }
+
   // 为单个卡片渲染评分
   function renderCard(card) {
     if (card.dataset.bhScored) return;
@@ -1812,14 +2027,12 @@
 
     if (!candidate) {
       candidate = domCandidate;
+    } else {
+      candidate = { ...candidate };
     }
 
-    // API数据可能缺少结构化工作经历，用DOM文本提取的指标补充
-    if (candidate.jobCount === 0 && domCandidate.jobCount > 0) {
-      candidate.jobCount = domCandidate.jobCount;
-      candidate.gapCount = domCandidate.gapCount;
-      candidate.maxGapMonths = domCandidate.maxGapMonths;
-    }
+    // 页面右侧时间轴往往比接口字段更贴近用户看到的信息，必要时用DOM时间段覆盖工作指标。
+    candidate = mergeCandidateJobMetrics(candidate, domCandidate);
 
     // 评分
     const result = scoreCandidate(candidate);
@@ -1880,6 +2093,25 @@
       lines.push('(无规则命中)');
     }
     lines.push('───────');
+    if (config.debugMode) {
+      const workGapRule = config.rules.find(r => r.id === 'work_gap');
+      const periods = Array.isArray(candidate.jobPeriods) ? candidate.jobPeriods : [];
+      lines.push(`[调试] 数据来源: ${candidate.source || 'unknown'} / 时间来源: ${candidate.jobPeriodsSource || 'none'}`);
+      lines.push(`[调试] 状态: ${candidate.status || '未知'} | 工作段: ${candidate.jobCount || 0} | gap数: ${candidate.gapCount || 0} | 最大空窗: ${candidate.maxGapMonths || 0}月`);
+      lines.push(`[调试] 学校: ${candidate.school || '无'} | 专业: ${candidate.major || '无'}`);
+      lines.push(`[调试] work_gap规则: ${workGapRule ? (workGapRule.enabled ? '启用' : '关闭') : '缺失'}`);
+      if (periods.length > 0) {
+        const periodText = periods.map(period => formatPeriod({
+          start: period.start ? new Date(period.start) : null,
+          end: period.end ? new Date(period.end) : null
+        })).join(' | ');
+        lines.push(`[调试] 识别时间段: ${periodText}`);
+      } else {
+        lines.push('[调试] 识别时间段: 无');
+      }
+      lines.push(`[调试] 文本片段: ${(candidate.rawText || '').slice(0, 180).replace(/\s+/g, ' ')}`);
+      lines.push('───────');
+    }
     lines.push(`总分: ${result.score}`);
     tooltip.textContent = lines.join('\n');
     card.appendChild(tooltip);
@@ -2314,8 +2546,10 @@
     } : { ...config.rules[index] };
 
     const fields = [
+      { value: '_computed', label: '计算字段' },
       { value: 'education', label: '学历' },
       { value: 'school', label: '学校' },
+      { value: 'major', label: '专业' },
       { value: 'experience', label: '工作年限' },
       { value: 'company', label: '公司' },
       { value: 'salaryMax', label: '期望薪资(上限K)' },
@@ -2337,8 +2571,18 @@
       { value: 'schoolLevel', label: '院校等级' },
       { value: 'gtPerUnit', label: '每超1单位' },
       { value: 'containsAnyWord', label: '包含任一词(精确)' },
-      { value: 'checkGender', label: '性别校验' }
+      { value: 'checkGender', label: '性别校验' },
+      { value: 'jobHopping', label: '频繁跳槽检测' },
+      { value: 'workGap', label: '工作空窗期检测' },
+      { value: 'overseasMaster', label: '海外名校硕士' }
     ];
+
+    if (!fields.some(f => f.value === rule.field)) {
+      fields.unshift({ value: rule.field, label: `当前值(${rule.field})` });
+    }
+    if (!operators.some(o => o.value === rule.operator)) {
+      operators.unshift({ value: rule.operator, label: `当前值(${rule.operator})` });
+    }
 
     const form = document.createElement('div');
     form.className = `${SCRIPT_PREFIX}-add-rule-form`;
@@ -2369,7 +2613,7 @@
       </div>
       <div class="${SCRIPT_PREFIX}-form-row">
         <label>值</label>
-        <input class="${SCRIPT_PREFIX}-input" value="${Array.isArray(rule.value) ? rule.value.join(', ') : rule.value}" data-field="value" style="flex:1"
+        <input class="${SCRIPT_PREFIX}-input" value="${Array.isArray(rule.value) ? rule.value.join(', ') : (rule.value ?? '')}" data-field="value" style="flex:1"
           placeholder="多个值用逗号分隔">
       </div>
       <div class="${SCRIPT_PREFIX}-form-row">
@@ -2388,6 +2632,28 @@
     if (existingForm) existingForm.remove();
     rulesSection.querySelector(`.${SCRIPT_PREFIX}-section-content`).appendChild(form);
 
+    const fieldSelect = form.querySelector('[data-field="field"]');
+    const operatorSelect = form.querySelector('[data-field="operator"]');
+    const valueInput = form.querySelector('[data-field="value"]');
+
+    const syncComputedRuleEditorState = () => {
+      const computedOperators = ['jobHopping', 'workGap', 'checkGender', 'overseasMaster'];
+      const isComputed = computedOperators.includes(operatorSelect.value);
+
+      if (isComputed) {
+        fieldSelect.value = '_computed';
+        valueInput.value = '';
+        valueInput.disabled = true;
+        valueInput.placeholder = '该条件无需填写值';
+      } else {
+        valueInput.disabled = false;
+        valueInput.placeholder = '多个值用逗号分隔';
+      }
+    };
+
+    operatorSelect.addEventListener('change', syncComputedRuleEditorState);
+    syncComputedRuleEditorState();
+
     // 保存
     form.querySelector(`#${SCRIPT_PREFIX}-rule-save`).addEventListener('click', () => {
       const newRule = {
@@ -2402,7 +2668,10 @@
 
       // 解析值
       const rawValue = form.querySelector('[data-field="value"]').value;
-      if (['in', 'notIn', 'containsAny'].includes(newRule.operator)) {
+      if (['jobHopping', 'workGap', 'checkGender', 'overseasMaster'].includes(newRule.operator)) {
+        newRule.field = '_computed';
+        newRule.value = null;
+      } else if (['in', 'notIn', 'containsAny'].includes(newRule.operator)) {
         newRule.value = rawValue.split(/[,，]\s*/).filter(Boolean);
       } else if (newRule.operator === 'between') {
         const parts = rawValue.split(/[,，\-~]\s*/).filter(Boolean).map(Number);

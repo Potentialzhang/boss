@@ -55,7 +55,7 @@
       "score": -20, "enabled": true
     },
     {
-      "id": "major_non_cs", "name": "非计算机专业减分", "field": "rawText",
+      "id": "major_non_cs", "name": "非计算机专业减分", "field": "major",
       "type": "penalty", "operator": "containsAny",
       "value": ["土木工程", "建筑学", "城市规划", "农学", "园艺", "畜牧", "林学", "文学", "历史学", "哲学", "社会学", "教育学", "法学", "临床医学", "护理学", "中医", "药学", "美术", "音乐", "体育", "新闻学", "广告学"],
       "score": -40, "enabled": true
