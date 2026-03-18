@@ -53,6 +53,10 @@
     {
       "id": "gender_mismatch", "name": "性别不符扣分", "field": "gender",
       "type": "penalty", "operator": "checkGender", "value": null, "score": -50, "enabled": true
+    },
+    {
+      "id": "work_gap", "name": "工作空窗期扣分", "field": "_computed",
+      "type": "penalty", "operator": "workGap", "value": null, "score": -8, "enabled": true
     }
   ],
   "positiveKeywords": ["React", "Vue", "TypeScript", "Node", "Go", "Java", "Python", "Rust", "Kubernetes", "Docker", "微服务", "分布式"],

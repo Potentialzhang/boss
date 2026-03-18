@@ -262,11 +262,25 @@
       ...defaults,
       ...saved,
       notifyThreshold,
-      rules: saved.rules || defaults.rules,
+      rules: mergeRulesWithDefaults(saved.rules || defaults.rules),
       positiveKeywords: saved.positiveKeywords || defaults.positiveKeywords,
       negativeKeywords: saved.negativeKeywords || defaults.negativeKeywords,
       customSchools: saved.customSchools || defaults.customSchools
     };
+  }
+
+  function mergeRulesWithDefaults(rules) {
+    const nextRules = Array.isArray(rules) ? JSON.parse(JSON.stringify(rules)) : [];
+    // 旧的本地配置、导入文件、远程角色配置可能缺少后续新增的 gap 规则，回填以避免静默失效。
+    const requiredRuleIds = ['work_gap'];
+    requiredRuleIds.forEach((ruleId) => {
+      if (nextRules.some(rule => rule.id === ruleId)) return;
+      const defaultRule = DEFAULT_RULES.find(rule => rule.id === ruleId);
+      if (defaultRule) {
+        nextRules.push(JSON.parse(JSON.stringify(defaultRule)));
+      }
+    });
+    return nextRules;
   }
 
   function normalizeNotifyThreshold() {
@@ -389,7 +403,7 @@
     // rules、阈值、薪资仅在换角色或手动同步时覆盖，F5自动同步保留本地编辑
     if (shouldOverwrite) {
       if (remoteData.rules && Array.isArray(remoteData.rules)) {
-        config.rules = JSON.parse(JSON.stringify(remoteData.rules));
+        config.rules = mergeRulesWithDefaults(remoteData.rules);
       }
       if (remoteData.positiveKeywords) {
         config.positiveKeywords = [...remoteData.positiveKeywords];
@@ -660,8 +674,29 @@
   function parseWorkDate(val) {
     if (!val) return null;
     if (typeof val === 'number') return new Date(val > 1e12 ? val : val * 1000);
-    const m = String(val).match(/(\d{4})[-./年](\d{1,2})/);
-    return m ? new Date(parseInt(m[1]), parseInt(m[2]) - 1) : null;
+    const str = String(val).trim();
+    if (/^(至今|现在|目前|present|current)$/i.test(str)) return null;
+    const monthMatch = str.match(/(\d{4})\s*[-./年]\s*(\d{1,2})(?:\s*月)?/);
+    if (monthMatch) {
+      return new Date(parseInt(monthMatch[1]), parseInt(monthMatch[2]) - 1);
+    }
+    const yearMatch = str.match(/^(\d{4})$/);
+    return yearMatch ? new Date(parseInt(yearMatch[1]), 0) : null;
+  }
+
+  function extractWorkPeriodsFromText(text) {
+    const periods = [];
+    if (!text) return periods;
+
+    const regex = /(\d{4})\s*[.\-/年]\s*(\d{1,2})(?:\s*月)?\s*[-–—~至]+\s*((\d{4})\s*[.\-/年]\s*(\d{1,2})(?:\s*月)?|至今|现在|目前|present|current)/gi;
+    let match;
+    while ((match = regex.exec(text)) !== null) {
+      const start = new Date(parseInt(match[1]), parseInt(match[2]) - 1);
+      const end = parseWorkDate(match[3]);
+      periods.push({ start, end });
+    }
+
+    return periods;
   }
 
   // 计算跳槽频率和空窗期指标
@@ -681,14 +716,7 @@
     // 只匹配带月份的日期范围（如 2021.07 - 2024.03），跳过纯年份范围（通常是教育经历）
     if (periods.length === 0) {
       const text = typeof raw === 'string' ? raw : JSON.stringify(raw);
-      const regex = /(\d{4})[.\-/](\d{1,2})\s*[-–~]\s*(\d{4})[.\-/](\d{1,2})/g;
-      let m;
-      while ((m = regex.exec(text)) !== null) {
-        periods.push({
-          start: new Date(parseInt(m[1]), parseInt(m[2]) - 1),
-          end: new Date(parseInt(m[3]), parseInt(m[4]) - 1)
-        });
-      }
+      periods = extractWorkPeriodsFromText(text);
       if (periods.length > 0) jobCount = periods.length;
     }
 
