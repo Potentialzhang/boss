@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘候选人智能筛选助手
 // @namespace    https://github.com/freekingxx/boss
-// @version      0.1.5
+// @version      0.1.6
 // @description  自动解析推荐牛人卡片信息，根据预设规则评分并高亮显示，帮助快速识别高匹配候选人
 // @author       BossHelper
 // @match        https://www.zhipin.com/*
@@ -40,6 +40,7 @@
   const PROBE_KEY = 'boss_helper_probe_mode';
   const REMOTE_CACHE_KEY = 'boss_helper_remote_config_v1';
   const REJECTED_KEY = 'boss_helper_rejected_v1';
+  const SEEN_CANDIDATES_KEY = 'boss_helper_seen_candidates_v1';
   const ROLE_URL_KEY = 'boss_helper_role_url';
   const DEFAULT_TOAST_DURATION = 4500;
   const AUTO_SCROLL_INTERVAL = 1400;
@@ -230,6 +231,9 @@
 
   // 「不合适」标记 — name → timestamp
   let rejectedMap = {};
+  let seenCandidatesMap = {};
+  let seenCandidatesSaveTimer = null;
+  const currentPageNewCandidateKeys = new Set();
 
   function loadRejected() {
     try { rejectedMap = JSON.parse(GM_getValue(REJECTED_KEY, '{}')); }
@@ -243,7 +247,42 @@
     saveRejected();
   }
 
+  function loadSeenCandidates() {
+    try { seenCandidatesMap = JSON.parse(GM_getValue(SEEN_CANDIDATES_KEY, '{}')); }
+    catch (e) { seenCandidatesMap = {}; }
+  }
+
+  function saveSeenCandidates() {
+    GM_setValue(SEEN_CANDIDATES_KEY, JSON.stringify(seenCandidatesMap));
+  }
+
+  function scheduleSaveSeenCandidates() {
+    if (seenCandidatesSaveTimer) clearTimeout(seenCandidatesSaveTimer);
+    seenCandidatesSaveTimer = setTimeout(() => {
+      seenCandidatesSaveTimer = null;
+      saveSeenCandidates();
+    }, 240);
+  }
+
+  function extractCandidateId(...sources) {
+    for (const source of sources) {
+      if (!source || typeof source !== 'object') continue;
+      const directId = source.candidateId || source.encryptGeekId || source.geekId || source.resumeId ||
+        source.encryptResumeId || source.securityId || source.uid || source.id;
+      if (directId !== undefined && directId !== null && String(directId).trim()) {
+        return String(directId).trim();
+      }
+      if (source.geekCard && typeof source.geekCard === 'object') {
+        const nestedId = extractCandidateId(source.geekCard);
+        if (nestedId) return nestedId;
+      }
+    }
+    return '';
+  }
+
   function buildCandidateKey(candidate) {
+    const candidateId = extractCandidateId(candidate);
+    if (candidateId) return `id::${candidateId}`;
     return [
       candidate.name || '',
       candidate.school || '',
@@ -251,6 +290,147 @@
       candidate.experience ?? '',
       candidate.salaryDesc || ''
     ].join('||');
+  }
+
+  function buildLiveMatchKey(candidate, cardElement) {
+    const profileUrl = candidate?.profileUrl || cardElement?.dataset?.bhProfileUrl || '';
+    if (profileUrl) return `url::${profileUrl}`;
+    const candidateId = extractCandidateId(candidate) || cardElement?.dataset?.bhCandidateId || '';
+    if (candidateId) return `id::${candidateId}`;
+    const candidateKey = buildCandidateKey(candidate);
+    if (candidateKey) return `key::${candidateKey}`;
+    const cardUid = cardElement?.dataset?.bhCardUid || '';
+    return cardUid ? `card::${cardUid}` : '';
+  }
+
+  function extractCandidateIdFromUrlString(urlString) {
+    if (!urlString) return '';
+    try {
+      const url = new URL(urlString, location.href);
+      return url.searchParams.get('geekId') ||
+        url.searchParams.get('encryptGeekId') ||
+        url.searchParams.get('resumeId') ||
+        url.searchParams.get('candidateId') ||
+        (url.pathname.match(/\/(?:geek|resume|candidate|recommend)\/([^/?#]+)/i)?.[1] || '');
+    } catch {
+      return '';
+    }
+  }
+
+  function normalizeCandidateProfileUrl(urlString) {
+    if (!urlString) return '';
+    try {
+      const url = new URL(urlString, location.href);
+      url.search = '';
+      url.hash = '';
+      return url.toString();
+    } catch {
+      return urlString;
+    }
+  }
+
+  function buildPersistentCandidateKey(candidate) {
+    if (!candidate) return '';
+    const candidateId = extractCandidateId(candidate);
+    if (candidateId) return `id::${candidateId}`;
+    if (candidate.profileUrl) return `url::${normalizeCandidateProfileUrl(candidate.profileUrl)}`;
+    const candidateKey = buildCandidateKey(candidate);
+    return candidateKey ? `key::${candidateKey}` : '';
+  }
+
+  function getSeenCandidateCount() {
+    return Object.keys(seenCandidatesMap).length;
+  }
+
+  function getRecentSeenCandidates(limit = 6) {
+    return Object.values(seenCandidatesMap)
+      .sort((a, b) => (b.lastSeenAt || 0) - (a.lastSeenAt || 0))
+      .slice(0, limit);
+  }
+
+  function rememberSeenCandidate(candidate) {
+    const key = buildPersistentCandidateKey(candidate);
+    if (!key) return { key: '', isNew: false, entry: null };
+
+    const now = Date.now();
+    let existing = seenCandidatesMap[key];
+    if (!existing && key.startsWith('id::')) {
+      const candidateId = key.slice(4);
+      for (const legacyKey of Object.keys(seenCandidatesMap)) {
+        if (!legacyKey.startsWith('url::')) continue;
+        if (extractCandidateIdFromUrlString(legacyKey.slice(5)) !== candidateId) continue;
+        existing = seenCandidatesMap[legacyKey];
+        delete seenCandidatesMap[legacyKey];
+        break;
+      }
+    }
+    const isAlreadyNewInPage = currentPageNewCandidateKeys.has(key);
+    const entry = {
+      key,
+      name: candidate.name || '未知候选人',
+      school: candidate.school || '',
+      company: candidate.company || '',
+      firstSeenAt: existing?.firstSeenAt || now,
+      lastSeenAt: now
+    };
+    seenCandidatesMap[key] = entry;
+    if (!existing) currentPageNewCandidateKeys.add(key);
+    scheduleSaveSeenCandidates();
+    return {
+      key,
+      isNew: !existing || isAlreadyNewInPage,
+      entry
+    };
+  }
+
+  function clearSeenCandidates() {
+    seenCandidatesMap = {};
+    currentPageNewCandidateKeys.clear();
+    if (seenCandidatesSaveTimer) {
+      clearTimeout(seenCandidatesSaveTimer);
+      seenCandidatesSaveTimer = null;
+    }
+    saveSeenCandidates();
+  }
+
+  function extractCandidateLinkInfo(cardElement) {
+    const anchors = [...cardElement.querySelectorAll('a[href]')];
+    for (const anchor of anchors) {
+      const href = anchor.getAttribute('href') || '';
+      if (!href) continue;
+      const absoluteUrl = (() => {
+        try {
+          return new URL(href, location.href);
+        } catch {
+          return null;
+        }
+      })();
+      if (!absoluteUrl) continue;
+      const hrefId = absoluteUrl.searchParams.get('geekId') ||
+        absoluteUrl.searchParams.get('encryptGeekId') ||
+        absoluteUrl.searchParams.get('resumeId') ||
+        absoluteUrl.searchParams.get('candidateId');
+      if (hrefId) {
+        return {
+          profileUrl: absoluteUrl.href,
+          candidateId: String(hrefId)
+        };
+      }
+      const pathMatch = absoluteUrl.pathname.match(/\/(?:geek|resume|candidate|recommend)\/([^/?#]+)/i);
+      if (pathMatch && pathMatch[1]) {
+        return {
+          profileUrl: absoluteUrl.href,
+          candidateId: pathMatch[1]
+        };
+      }
+      if (/geek|resume|candidate/i.test(absoluteUrl.pathname)) {
+        return {
+          profileUrl: absoluteUrl.href,
+          candidateId: ''
+        };
+      }
+    }
+    return { profileUrl: '', candidateId: '' };
   }
 
   function exportJsonFile(data, fileName) {
@@ -501,7 +681,7 @@
   // Section 3: API 拦截器
   // ============================================================
 
-  const candidateStore = new Map(); // name -> candidate data
+  const candidateStore = new Map(); // name -> candidate data list
   let interceptedCount = 0;
 
   function setupInterceptors() {
@@ -596,7 +776,11 @@
       candidates.forEach(c => {
         const parsed = parseCandidateFromApi(c);
         if (parsed && parsed.name) {
-          candidateStore.set(parsed.name, parsed);
+          const existing = candidateStore.get(parsed.name) || [];
+          const candidateKey = buildCandidateKey(parsed);
+          const nextList = existing.filter(item => buildCandidateKey(item) !== candidateKey);
+          nextList.unshift(parsed);
+          candidateStore.set(parsed.name, nextList.slice(0, 8));
         }
       });
       // 触发一次重新评分
@@ -684,6 +868,7 @@
 
     // 尝试多种可能的字段名
     const name = card?.geekName || raw.name || raw.geekName || raw.nickName || raw.username || '';
+    const candidateId = extractCandidateId(raw, card);
     const age = card?.age || raw.age || extractNumber(card?.ageDesc || '', /(\d{2})岁/) || extractNumber(text, /(\d{2})岁/);
     const education = primaryEdu?.degreeName || card?.geekDegree || raw.education || raw.degree || raw.degreeName ||
       extractMatch(text, /(博士|硕士|MBA|本科|大专|高中|中专)/);
@@ -722,6 +907,7 @@
     const jobMetrics = computeJobMetrics(metricsSource, experience);
 
     return {
+      candidateId,
       name,
       age: typeof age === 'number' ? age : null,
       education: education || null,
@@ -1259,11 +1445,70 @@
     return result.score >= config.notifyThreshold;
   }
 
+  function ensureCardUid(cardElement) {
+    if (!cardElement) return '';
+    if (!cardElement.dataset.bhCardUid) {
+      cardElement.dataset.bhCardUid = String(nextCardUid++);
+    }
+    return cardElement.dataset.bhCardUid;
+  }
+
+  function scoreCandidateSimilarity(baseCandidate, targetCandidate) {
+    if (!baseCandidate || !targetCandidate) return -1;
+    if (baseCandidate.name && targetCandidate.name && baseCandidate.name !== targetCandidate.name) return -1;
+
+    let score = 0;
+    if (baseCandidate.candidateId && targetCandidate.candidateId && baseCandidate.candidateId === targetCandidate.candidateId) score += 20;
+    if (baseCandidate.school && targetCandidate.school) {
+      if (baseCandidate.school === targetCandidate.school) score += 6;
+      else if (baseCandidate.school.includes(targetCandidate.school) || targetCandidate.school.includes(baseCandidate.school)) score += 3;
+    }
+    if (baseCandidate.company && targetCandidate.company) {
+      if (baseCandidate.company === targetCandidate.company) score += 6;
+      else if (baseCandidate.company.includes(targetCandidate.company) || targetCandidate.company.includes(baseCandidate.company)) score += 3;
+    }
+    if (baseCandidate.education && targetCandidate.education && baseCandidate.education === targetCandidate.education) score += 3;
+    if (baseCandidate.salaryDesc && targetCandidate.salaryDesc && baseCandidate.salaryDesc === targetCandidate.salaryDesc) score += 3;
+    if (baseCandidate.experience != null && targetCandidate.experience != null) {
+      const diff = Math.abs(Number(baseCandidate.experience) - Number(targetCandidate.experience));
+      if (diff === 0) score += 4;
+      else if (diff <= 1) score += 2;
+    }
+    if (baseCandidate.rawText && targetCandidate.school && baseCandidate.rawText.includes(targetCandidate.school)) score += 1;
+    if (baseCandidate.rawText && targetCandidate.company && baseCandidate.rawText.includes(targetCandidate.company)) score += 1;
+    return score;
+  }
+
+  function findBestStoredCandidate(domCandidate) {
+    if (!domCandidate?.name) return null;
+    const matchedList = candidateStore.get(domCandidate.name);
+    if (!Array.isArray(matchedList) || matchedList.length === 0) return null;
+    if (matchedList.length === 1) return matchedList[0];
+
+    let bestCandidate = null;
+    let bestScore = -1;
+    matchedList.forEach((candidate) => {
+      const score = scoreCandidateSimilarity(domCandidate, candidate);
+      if (score > bestScore) {
+        bestScore = score;
+        bestCandidate = candidate;
+      }
+    });
+    return bestCandidate || matchedList[0];
+  }
+
   function updateLiveMatchEntry(candidate, result, cardElement) {
     if (!candidate || !result || !cardElement) return;
-    const key = buildCandidateKey(candidate);
-    liveMatchStore.set(key, {
-      key,
+    const cardUid = ensureCardUid(cardElement);
+    const liveMatchKey = buildLiveMatchKey(candidate, cardElement);
+    if (!liveMatchKey) return;
+    const existing = liveMatchStore.get(liveMatchKey);
+    liveMatchStore.set(liveMatchKey, {
+      key: liveMatchKey,
+      cardUid,
+      candidateId: extractCandidateId(candidate) || '',
+      candidateKey: buildCandidateKey(candidate),
+      profileUrl: candidate.profileUrl || '',
       name: candidate.name || '未知候选人',
       score: result.score,
       level: result.level,
@@ -1275,6 +1520,7 @@
       status: candidate.status || '',
       highlightedKeywords: Array.isArray(result.highlightedKeywords) ? [...result.highlightedKeywords] : [],
       matchedRules: Array.isArray(result.matchedRules) ? result.matchedRules.map(rule => rule.name) : [],
+      order: existing?.order ?? liveMatchSequence++,
       updatedAt: Date.now(),
       cardElement
     });
@@ -1287,8 +1533,7 @@
         highlightedKeywords: item.highlightedKeywords
       }))
       .sort((a, b) => {
-        if ((b.score || 0) !== (a.score || 0)) return (b.score || 0) - (a.score || 0);
-        return (b.updatedAt || 0) - (a.updatedAt || 0);
+        return (a.order || 0) - (b.order || 0);
       });
   }
 
@@ -1296,10 +1541,16 @@
     if (item?.cardElement?.isConnected) return item.cardElement;
     const cards = getCardElements();
     for (const card of cards) {
-      if (card.dataset.bhCandidateKey === item.key) return card;
+      if (item?.cardUid && card.dataset.bhCardUid === item.cardUid) return card;
     }
     for (const card of cards) {
-      if (item.name && (card.textContent || '').includes(item.name)) return card;
+      if (item?.profileUrl && card.dataset.bhProfileUrl === item.profileUrl) return card;
+    }
+    for (const card of cards) {
+      if (item?.candidateId && card.dataset.bhCandidateId === item.candidateId) return card;
+    }
+    for (const card of cards) {
+      if (item?.candidateKey && card.dataset.bhCandidateKey === item.candidateKey) return card;
     }
     return null;
   }
@@ -1309,12 +1560,41 @@
     if (!item) return;
     const cardElement = findCardForLiveMatch(item);
     if (!cardElement) {
-      alert('当前页面里找不到该候选人卡片，可能尚未加载或已被页面卸载。');
+      showTooltip('当前页面里找不到该候选人卡片，可能已被页面卸载或尚未滚动加载。');
       return;
     }
     cardElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
     cardElement.style.outline = '3px solid #1677ff';
     setTimeout(() => { cardElement.style.outline = ''; }, 2200);
+  }
+
+  function pruneLiveMatchStore() {
+    const visibleCards = getCardElements();
+    const cardUidSet = new Set();
+    const profileUrlSet = new Set();
+    const candidateIdSet = new Set();
+    const candidateKeySet = new Set();
+    visibleCards.forEach((card) => {
+      cardUidSet.add(ensureCardUid(card));
+      if (card.dataset.bhProfileUrl) profileUrlSet.add(card.dataset.bhProfileUrl);
+      if (card.dataset.bhCandidateId) candidateIdSet.add(card.dataset.bhCandidateId);
+      if (card.dataset.bhCandidateKey) candidateKeySet.add(card.dataset.bhCandidateKey);
+    });
+    for (const [key, item] of liveMatchStore.entries()) {
+      if (item?.cardUid && cardUidSet.has(item.cardUid)) continue;
+      if (item?.profileUrl && profileUrlSet.has(item.profileUrl)) continue;
+      if (item?.candidateId && candidateIdSet.has(item.candidateId)) continue;
+      if (item?.candidateKey && candidateKeySet.has(item.candidateKey)) continue;
+      liveMatchStore.delete(key);
+    }
+  }
+
+  function scheduleLiveMatchPanelRender() {
+    if (liveMatchRenderTimer) return;
+    liveMatchRenderTimer = requestAnimationFrame(() => {
+      liveMatchRenderTimer = null;
+      renderLiveMatchPanel();
+    });
   }
 
   function showToast(candidate, result, cardElement) {
@@ -1521,6 +1801,7 @@
     const baseText = cardElement.textContent || '';
     const name = extractCandidateName(cardElement);
     const text = expandCandidateTextScope(cardElement, baseText, name);
+    const linkInfo = extractCandidateLinkInfo(cardElement);
 
     const education = extractMatch(text, /(博士|硕士|MBA|本科|大专|高中|中专)/);
     const experience = extractNumber(text, /(\d+)[年]/) || extractNumber(text, /经验\s*(\d+)/);
@@ -1537,6 +1818,8 @@
     }
 
     return {
+      candidateId: linkInfo.candidateId || '',
+      profileUrl: linkInfo.profileUrl || '',
       name: name || '未知',
       age: age || null,
       education: education || null,
@@ -1617,8 +1900,11 @@
   let liveMatchSummaryEl = null;
   let liveMatchModeSelect = null;
   let liveMatchCollapsed = false;
+  let liveMatchRenderTimer = null;
   let interactionHooksBound = false;
   const liveMatchStore = new Map();
+  let liveMatchSequence = 0;
+  let nextCardUid = 1;
   const autoScrollState = {
     active: false,
     timer: null,
@@ -1651,6 +1937,22 @@
       .${SCRIPT_PREFIX}-badge-high { background: #4CAF50; }
       .${SCRIPT_PREFIX}-badge-medium { background: #FF9800; }
       .${SCRIPT_PREFIX}-badge-low { background: #9E9E9E; }
+      .${SCRIPT_PREFIX}-badge-new {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 14px;
+        height: 14px;
+        margin-left: 4px;
+        padding: 0 4px;
+        border-radius: 999px;
+        background: #f5222d;
+        color: #fff;
+        font-size: 10px;
+        font-weight: 700;
+        line-height: 14px;
+        vertical-align: top;
+      }
 
       /* 关键词匹配徽章 */
       .${SCRIPT_PREFIX}-keyword-badge {
@@ -2355,8 +2657,87 @@
     `);
   }
 
+  function hasCandidatePageShell() {
+    return !!document.querySelector(
+      '.recommend-card-wrap, .candidate-list, .geek-list, [class*="recommend-card"], [class*="candidate-list"], [class*="geek-list"], [class*="recommend"] [class*="card"], [class*="search"] [class*="card"]'
+    );
+  }
+
+  function hasCommunicationPageShell() {
+    return !!document.querySelector(
+      '[class*="chat-content"], [class*="chat-window"], [class*="message-list"], [class*="message-item"], [class*="conversation"], [data-testid*="chat"], [data-testid*="message"]'
+    );
+  }
+
+  function isCommunicationPage() {
+    const routeText = `${location.pathname} ${location.hash} ${location.search}`.toLowerCase();
+    if (/(^|\/)(chat|message|communicate|communication)(\/|$)/.test(routeText)) return true;
+    if (hasCandidatePageShell()) return false;
+    return hasCommunicationPageShell();
+  }
+
+  function shouldEnhanceCandidatePage() {
+    if (hasCandidatePageShell()) return true;
+    if (isCommunicationPage()) return false;
+
+    const routeText = `${location.pathname} ${location.hash} ${location.search}`.toLowerCase();
+    return /(recommend|search|candidate|resume|geek)/.test(routeText);
+  }
+
+  function clearDecoratedCards() {
+    document.querySelectorAll(`.${SCRIPT_PREFIX}-badge, .${SCRIPT_PREFIX}-tooltip, .${SCRIPT_PREFIX}-reject-btn, .${SCRIPT_PREFIX}-keyword-badge`).forEach(el => el.remove());
+    document.querySelectorAll(
+      `[data-bh-scored], [data-bh-card-uid], .${SCRIPT_PREFIX}-card-high, .${SCRIPT_PREFIX}-card-medium, .${SCRIPT_PREFIX}-card-low, .${SCRIPT_PREFIX}-card-rejected`
+    ).forEach((card) => {
+      if (!(card instanceof HTMLElement)) return;
+      delete card.dataset.bhScored;
+      delete card.dataset.bhScore;
+      delete card.dataset.bhLevel;
+      delete card.dataset.bhCandidateKey;
+      delete card.dataset.bhCandidateId;
+      delete card.dataset.bhProfileUrl;
+      delete card.dataset.bhCardUid;
+      card.classList.remove(`${SCRIPT_PREFIX}-card-high`, `${SCRIPT_PREFIX}-card-medium`, `${SCRIPT_PREFIX}-card-low`, `${SCRIPT_PREFIX}-card-rejected`, `${SCRIPT_PREFIX}-card-pulse`);
+      card.style.opacity = '';
+      card.style.outline = '';
+      if (card.dataset.bhOriginalPosition !== undefined) {
+        card.style.position = card.dataset.bhOriginalPosition;
+        delete card.dataset.bhOriginalPosition;
+      } else if (card.style.position === 'relative') {
+        card.style.position = '';
+      }
+    });
+  }
+
+  function teardownCandidateUi(reason = '') {
+    detectedCardSelector = null;
+    liveMatchStore.clear();
+    if (liveMatchRenderTimer) {
+      cancelAnimationFrame(liveMatchRenderTimer);
+      liveMatchRenderTimer = null;
+    }
+    if (statsBar) {
+      statsBar.remove();
+      statsBar = null;
+    }
+    document.getElementById(`${SCRIPT_PREFIX}-toast-container`)?.remove();
+    document.querySelectorAll(`.${SCRIPT_PREFIX}-toggle-btn`).forEach(btn => btn.remove());
+    document.querySelectorAll(`.${SCRIPT_PREFIX}-auto-scroll-btn`).forEach(btn => btn.remove());
+    document.querySelectorAll(`.${SCRIPT_PREFIX}-live-match`).forEach(el => el.remove());
+    toggleBtn = null;
+    autoScrollBtn = null;
+    liveMatchPanel = null;
+    liveMatchListEl = null;
+    liveMatchSummaryEl = null;
+    liveMatchModeSelect = null;
+    clearDecoratedCards();
+    if (autoScrollState.active) stopAutoScroll(reason || '当前页面不是候选人列表页');
+  }
+
   // 检测候选人卡片
   function detectCardElements() {
+    if (!shouldEnhanceCandidatePage()) return [];
+
     // 策略1: 通过已知的class模式匹配
     const knownSelectors = [
       '.recommend-card-wrap li',
@@ -2451,6 +2832,7 @@
   }
 
   function getCardElements() {
+    if (!shouldEnhanceCandidatePage()) return [];
     if (detectedCardSelector) {
       const cards = [...document.querySelectorAll(detectedCardSelector)].filter(card => !isCardTemporarilyHidden(card));
       if (cards.length > 0) return cards;
@@ -2701,7 +3083,7 @@
     liveMatchModeSelect.addEventListener('change', (event) => {
       config.liveMatchMode = event.target.value === 'highlight' ? 'highlight' : 'score';
       saveConfig();
-      renderLiveMatchPanel();
+      scheduleLiveMatchPanelRender();
     });
 
     const autoBtn = document.createElement('button');
@@ -2710,7 +3092,7 @@
     autoBtn.addEventListener('click', (event) => {
       event.stopPropagation();
       toggleAutoScroll();
-      renderLiveMatchPanel();
+      scheduleLiveMatchPanelRender();
     });
 
     toolbar.appendChild(liveMatchModeSelect);
@@ -2749,7 +3131,9 @@
       liveMatchModeSelect.value = getLiveMatchMode();
     }
 
+    pruneLiveMatchStore();
     const items = getLiveMatchItems();
+    const previousScrollTop = liveMatchListEl.scrollTop;
     if (liveMatchPanel._countEl) {
       liveMatchPanel._countEl.textContent = String(items.length);
     }
@@ -2769,6 +3153,7 @@
         ? '还没有命中高亮关键词的候选人。'
         : '还没有达到分数阈值的候选人。';
       liveMatchListEl.appendChild(empty);
+      liveMatchListEl.scrollTop = 0;
       return;
     }
 
@@ -2823,6 +3208,11 @@
       wrapper.appendChild(actions);
       liveMatchListEl.appendChild(wrapper);
     });
+
+    liveMatchListEl.scrollTop = Math.min(
+      previousScrollTop,
+      Math.max(0, liveMatchListEl.scrollHeight - liveMatchListEl.clientHeight)
+    );
   }
 
   function mergeCandidateJobMetrics(candidate, domCandidate) {
@@ -2851,6 +3241,7 @@
   // 为单个卡片渲染评分
   function renderCard(card) {
     if (card.dataset.bhScored === '1') return;
+    ensureCardUid(card);
 
     if (isCardTemporarilyHidden(card)) {
       card.dataset.bhScored = 'pending';
@@ -2868,13 +3259,12 @@
     const domCandidate = parseCandidateFromDOM(card);
 
     // 尝试从API数据匹配
-    if (domCandidate.name && candidateStore.has(domCandidate.name)) {
-      candidate = candidateStore.get(domCandidate.name);
-    } else {
+    candidate = findBestStoredCandidate(domCandidate);
+    if (!candidate) {
       // 尝试模糊匹配
-      for (const [name, data] of candidateStore) {
+      for (const [name, items] of candidateStore) {
         if (domCandidate.rawText.includes(name)) {
-          candidate = data;
+          candidate = Array.isArray(items) && items.length > 0 ? items[0] : null;
           break;
         }
       }
@@ -2886,8 +3276,13 @@
       candidate = { ...candidate };
     }
 
+    candidate.candidateId = candidate.candidateId || domCandidate.candidateId || '';
+    candidate.profileUrl = candidate.profileUrl || domCandidate.profileUrl || '';
+
     // 页面右侧时间轴往往比接口字段更贴近用户看到的信息，必要时用DOM时间段覆盖工作指标。
     candidate = mergeCandidateJobMetrics(candidate, domCandidate);
+
+    const seenInfo = rememberSeenCandidate(candidate);
 
     // 评分
     const result = scoreCandidate(candidate);
@@ -2897,6 +3292,11 @@
     card.dataset.bhScore = result.score;
     card.dataset.bhLevel = result.level;
     card.dataset.bhCandidateKey = buildCandidateKey(candidate);
+    card.dataset.bhCandidateId = candidate.candidateId || '';
+    card.dataset.bhProfileUrl = candidate.profileUrl || '';
+    if (card.dataset.bhOriginalPosition === undefined) {
+      card.dataset.bhOriginalPosition = card.style.position || '';
+    }
     card.style.position = 'relative';
 
     // 添加卡片高亮class
@@ -2906,6 +3306,12 @@
     const badge = document.createElement('span');
     badge.className = `${SCRIPT_PREFIX}-badge ${SCRIPT_PREFIX}-badge-${result.level}`;
     badge.textContent = `${result.score}分`;
+    if (seenInfo.isNew) {
+      const newTag = document.createElement('span');
+      newTag.className = `${SCRIPT_PREFIX}-badge-new`;
+      newTag.textContent = '新';
+      badge.appendChild(newTag);
+    }
     card.appendChild(badge);
 
     // 「不合适」标记按钮
@@ -2970,7 +3376,7 @@
     bindTooltipHover(badge, lines.join('\n'));
 
     updateLiveMatchEntry(candidate, result, card);
-    renderLiveMatchPanel();
+    scheduleLiveMatchPanelRender();
 
     // 高分候选人通知
     notifyHighScoreCandidate(candidate, result, card);
@@ -2978,20 +3384,33 @@
 
   // 处理所有卡片
   function processCards() {
+    if (!shouldEnhanceCandidatePage()) {
+      teardownCandidateUi('当前页面不是候选人列表页');
+      return;
+    }
     const cards = getCardElements();
+    if (cards.length === 0) {
+      return;
+    }
     cards.forEach(card => renderCard(card));
     updateStats();
-    renderLiveMatchPanel();
+    scheduleLiveMatchPanelRender();
   }
 
   // 重新评分所有卡片
   function rescoreAllCards() {
+    if (!shouldEnhanceCandidatePage()) {
+      teardownCandidateUi('当前页面不是候选人列表页');
+      return;
+    }
     liveMatchStore.clear();
-    renderLiveMatchPanel();
+    scheduleLiveMatchPanelRender();
     const cards = getCardElements();
     cards.forEach(card => {
       card.dataset.bhScored = '';
       delete card.dataset.bhCandidateKey;
+      delete card.dataset.bhCandidateId;
+      delete card.dataset.bhProfileUrl;
       card.querySelectorAll(`.${SCRIPT_PREFIX}-badge, .${SCRIPT_PREFIX}-tooltip, .${SCRIPT_PREFIX}-reject-btn, .${SCRIPT_PREFIX}-keyword-badge`).forEach(el => el.remove());
       card.classList.remove(`${SCRIPT_PREFIX}-card-high`, `${SCRIPT_PREFIX}-card-medium`, `${SCRIPT_PREFIX}-card-low`, `${SCRIPT_PREFIX}-card-rejected`);
       card.style.opacity = '';
@@ -3038,6 +3457,10 @@
     if (observer) observer.disconnect();
 
     observer = new MutationObserver(() => {
+      if (!shouldEnhanceCandidatePage()) {
+        teardownCandidateUi('当前页面不是候选人列表页');
+        return;
+      }
       ensureToggleButton();
       clearTimeout(debounceTimer);
       debounceTimer = setTimeout(() => processCards(), 300);
@@ -3942,6 +4365,40 @@
     });
     content.appendChild(epInput);
 
+    const seenSection = document.createElement('div');
+    seenSection.style.cssText = 'margin-top:12px; padding-top:12px; border-top:1px solid #f0f0f0;';
+
+    const seenHead = document.createElement('div');
+    seenHead.style.cssText = 'display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px;';
+
+    const seenTitle = document.createElement('div');
+    seenTitle.style.cssText = 'font-size:13px; font-weight:600; color:#333;';
+    seenTitle.textContent = '本地候选人列表';
+    seenHead.appendChild(seenTitle);
+
+    const clearSeenBtn = document.createElement('button');
+    clearSeenBtn.className = `${SCRIPT_PREFIX}-btn ${SCRIPT_PREFIX}-btn-outline`;
+    clearSeenBtn.textContent = '清空';
+    clearSeenBtn.addEventListener('click', () => {
+      if (!confirm('确定清空本地候选人列表？清空后当前页面候选人会重新按“新”标记。')) return;
+      clearSeenCandidates();
+      refreshPanelContent();
+      rescoreAllCards();
+    });
+    seenHead.appendChild(clearSeenBtn);
+    seenSection.appendChild(seenHead);
+
+    const seenSummary = document.createElement('div');
+    seenSummary.style.cssText = 'font-size:12px; color:#666; line-height:1.6;';
+    const recentSeen = getRecentSeenCandidates(5);
+    if (recentSeen.length === 0) {
+      seenSummary.textContent = '当前为空。后续出现过的候选人会自动记录到本地。';
+    } else {
+      seenSummary.textContent = `已记录 ${getSeenCandidateCount()} 人。最近出现：${recentSeen.map(item => item.name).join('、')}`;
+    }
+    seenSection.appendChild(seenSummary);
+    content.appendChild(seenSection);
+
     return section;
   }
 
@@ -4044,6 +4501,7 @@
     // 加载配置
     loadConfig();
     loadRejected();
+    loadSeenCandidates();
 
     // 注入拦截器（在document-start阶段）
     setupInterceptors();
@@ -4103,17 +4561,12 @@
 
   function ensureToggleButton() {
     if (!document.body) return;
+    if (!shouldEnhanceCandidatePage()) {
+      teardownCandidateUi('当前页面不是候选人列表页');
+      return;
+    }
     if (!hasCandidateCards()) {
-      document.querySelectorAll(`.${SCRIPT_PREFIX}-toggle-btn`).forEach(btn => btn.remove());
-      document.querySelectorAll(`.${SCRIPT_PREFIX}-auto-scroll-btn`).forEach(btn => btn.remove());
-      document.querySelectorAll(`.${SCRIPT_PREFIX}-live-match`).forEach(el => el.remove());
-      toggleBtn = null;
-      autoScrollBtn = null;
-      liveMatchPanel = null;
-      liveMatchListEl = null;
-      liveMatchSummaryEl = null;
-      liveMatchModeSelect = null;
-      if (autoScrollState.active) stopAutoScroll('页面中未检测到候选人卡片');
+      detectedCardSelector = null;
       return;
     }
 
@@ -4146,10 +4599,11 @@
     }
     ensureLiveMatchPanel();
     updateAutoScrollButton();
-    renderLiveMatchPanel();
+    scheduleLiveMatchPanelRender();
   }
 
   function hasCandidateCards() {
+    if (!shouldEnhanceCandidatePage()) return false;
     return getCardElements().length > 0;
   }
 
